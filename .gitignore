@@ -1,0 +1,7 @@
+.env
+profile/
+__pycache__/
+*.pyc
+*.b64
+part_*
+srv_*
