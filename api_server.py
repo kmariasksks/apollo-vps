@@ -13,6 +13,22 @@ import browser_engine as be
 
 app = Flask(__name__)
 
+# ── Захист: перевірка X-API-Key на «робочих» ендпоінтах ──────────────────
+_PROTECTED_PREFIXES = ("/search", "/company", "/jobs", "/batch-search")
+
+
+@app.before_request
+def _check_api_key():
+    # Якщо ключ не заданий у .env — захист вимкнено (щоб не зламати).
+    if not API_KEY:
+        return None
+    path = request.path or ""
+    if any(path.startswith(p) for p in _PROTECTED_PREFIXES):
+        provided = request.headers.get("X-API-Key", "")
+        if provided != API_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+    return None
+
 PROXY_CONFIGURED = bool(os.environ.get("PROXY_SERVER", "").strip())
 
 NORMAL_DELAY_MIN = float(os.environ.get("DELAY_MIN", 3))
@@ -31,6 +47,7 @@ BATCH_PER_PAGE = int(os.environ.get("BATCH_PER_PAGE", 100))
 CLAY_WEBHOOK_URL = os.environ.get("CLAY_WEBHOOK_URL", "").strip()
 CLAY_WEBHOOK_TOKEN = os.environ.get("CLAY_WEBHOOK_TOKEN", "").strip()
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 2))
+API_KEY = os.environ.get("API_KEY", "").strip()
 
 _throttle_lock = threading.Lock()
 _next_allowed = 0.0
