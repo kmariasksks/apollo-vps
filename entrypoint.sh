@@ -23,4 +23,4 @@ echo " Xvfb + VNC запущені (без пароля, через тунель
 echo " Запускаю API-сервер (api_server.py)."
 echo "==============================================="
 
-exec python
+exec python /app/api_server.py
