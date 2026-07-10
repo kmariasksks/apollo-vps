@@ -48,6 +48,9 @@ CLAY_WEBHOOK_URL = os.environ.get("CLAY_WEBHOOK_URL", "").strip()
 CLAY_WEBHOOK_TOKEN = os.environ.get("CLAY_WEBHOOK_TOKEN", "").strip()
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 2))
 API_KEY = os.environ.get("API_KEY", "").strip()
+CAPTCHA_WEBHOOK_URL = os.environ.get("CAPTCHA_WEBHOOK_URL", "").strip()
+CAPTCHA_PAUSE = float(os.environ.get("CAPTCHA_PAUSE", 120))
+_last_captcha_notify = [0.0]
 
 _throttle_lock = threading.Lock()
 _next_allowed = 0.0
@@ -77,6 +80,19 @@ def _backoff(attempt):
     print(f"[backoff] attempt {attempt + 1} -> sleep {wait:.0f}s")
     time.sleep(wait)
 
+def notify_captcha():
+    """Сповістити n8n про капчу (не частіше разу на 5 хв, щоб не спамити)."""
+    if not CAPTCHA_WEBHOOK_URL:
+        return
+    now = time.time()
+    if now - _last_captcha_notify[0] < 300:
+        return
+    _last_captcha_notify[0] = now
+    try:
+        requests.post(CAPTCHA_WEBHOOK_URL, json={"event": "captcha"}, timeout=10)
+        print("[captcha] сповіщення надіслано в n8n")
+    except Exception as e:
+        print(f"[captcha] не вдалось сповістити: {e}")
 
 def apollo_request(method, url, params=None, json=None, **_ignore):
     global _session_problem
@@ -93,7 +109,11 @@ def apollo_request(method, url, params=None, json=None, **_ignore):
         if status == -2 or status in (401, 403):
             _session_problem = True
             print(f"[apollo_request] status {status} — капча або сесія впала")
-            if attempt < MAX_RETRIES - 1:
+            if status == -2:
+                notify_captcha()
+                print(f"[apollo_request] чекаю {CAPTCHA_PAUSE:.0f}s щоб встигли пройти капчу")
+                time.sleep(CAPTCHA_PAUSE)
+            elif attempt < MAX_RETRIES - 1:
                 _backoff(attempt)
             continue
 
