@@ -51,6 +51,7 @@ API_KEY = os.environ.get("API_KEY", "").strip()
 CAPTCHA_WEBHOOK_URL = os.environ.get("CAPTCHA_WEBHOOK_URL", "").strip()
 CAPTCHA_PAUSE = float(os.environ.get("CAPTCHA_PAUSE", 120))
 _last_captcha_notify = [0.0]
+_captcha_active = threading.Event()  # глобальний стоп-кран: капча активна
 
 _throttle_lock = threading.Lock()
 _next_allowed = 0.0
@@ -104,12 +105,14 @@ def apollo_request(method, url, params=None, json=None, **_ignore):
 
         if status == 200 and data is not None:
             _session_problem = False
+            _captcha_active.clear()  # капча точно пройдена — гасимо стоп-кран
             return data, 200
 
         if status == -2 or status in (401, 403):
             _session_problem = True
             print(f"[apollo_request] status {status} — капча або сесія впала")
             if status == -2:
+                _captcha_active.set()  # вмикаємо стоп-кран для всієї черги
                 notify_captcha()
                 print(f"[apollo_request] чекаю {CAPTCHA_PAUSE:.0f}s щоб встигли пройти капчу")
                 time.sleep(CAPTCHA_PAUSE)
@@ -604,6 +607,11 @@ def _worker(worker_id):
     while True:
         job_id, params = _job_queue.get()
         try:
+            # Стоп-кран: якщо капча активна — чекаємо, поки її пройдуть.
+            while _captcha_active.is_set():
+                print(f"[worker {worker_id}] капча активна — чекаю, черга на паузі")
+                notify_captcha()  # нагадати (спрацює не частіше 5хв)
+                time.sleep(15)
             process_search_job(job_id, params)
         finally:
             _job_queue.task_done()
