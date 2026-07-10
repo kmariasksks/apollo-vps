@@ -95,6 +95,23 @@ def notify_captcha():
     except Exception as e:
         print(f"[captcha] не вдалось сповістити: {e}")
 
+_last_done_notify = [0.0]
+
+
+def notify_done():
+    """Сповістити n8n, що черга опрацьована (не частіше разу на 2 хв)."""
+    if not CAPTCHA_WEBHOOK_URL:
+        return
+    now = time.time()
+    if now - _last_done_notify[0] < 120:
+        return
+    _last_done_notify[0] = now
+    try:
+        requests.post(CAPTCHA_WEBHOOK_URL, json={"event": "done"}, timeout=10)
+        print("[done] сповіщення про завершення надіслано в n8n")
+    except Exception as e:
+        print(f"[done] не вдалось сповістити: {e}")
+
 def apollo_request(method, url, params=None, json=None, **_ignore):
     global _session_problem
     last_status = None
@@ -561,6 +578,7 @@ def process_search_job(job_id, params):
         if not org_basic:
             _set_job(job_id, status="not_found", people_sent=0,
                      error=f"Company not found: {domain}")
+            print(f"[job {job_id[:8]}] {domain}: НЕ ЗНАЙДЕНО в Apollo")
             return
 
         org_id = org_basic["id"]
@@ -573,12 +591,15 @@ def process_search_job(job_id, params):
                (max_e is not None and (num_employees or 10**9) > max_e):
                 _set_job(job_id, status="skipped", people_sent=0,
                          error=f"employees={num_employees} поза діапазоном")
+                print(f"[job {job_id[:8]}] {domain}: ПРОПУЩЕНО (працівників {num_employees} поза діапазоном)")
                 return
             if excluded and industries:
                 ex = [i.lower() for i in excluded]
-                if any(ind.lower() in ex for ind in industries):
+                hit = next((ind for ind in industries if ind.lower() in ex), None)
+                if hit:
                     _set_job(job_id, status="skipped", people_sent=0,
-                             error="industry excluded")
+                             error=f"industry '{hit}' excluded")
+                    print(f"[job {job_id[:8]}] {domain}: ПРОПУЩЕНО (індустрія '{hit}' виключена)")
                     return
 
         people = search_people(
@@ -607,14 +628,16 @@ def _worker(worker_id):
     while True:
         job_id, params = _job_queue.get()
         try:
-            # Стоп-кран: якщо капча активна — чекаємо, поки її пройдуть.
             while _captcha_active.is_set():
                 print(f"[worker {worker_id}] капча активна — чекаю, черга на паузі")
-                notify_captcha()  # нагадати (спрацює не частіше 5хв)
+                notify_captcha()
                 time.sleep(15)
             process_search_job(job_id, params)
         finally:
             _job_queue.task_done()
+            # Якщо черга спорожніла — сповістити, що прогін завершено
+            if _job_queue.empty():
+                notify_done()
 
 
 @app.route("/search-async", methods=["POST"])
