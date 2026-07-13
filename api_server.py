@@ -784,6 +784,61 @@ def job_status(job_id):
         return jsonify({"error": "job not found"}), 404
     return jsonify({"job_id": job_id, **job})
 
+@app.route("/debug-bulk", methods=["POST"])
+def debug_bulk():
+    """ДІАГНОСТИКА: балковий запит з УСІМА фільтрами всередині, повертає сиру статистику Apollo."""
+    data = request.json or {}
+    domains = data.get("domains", [])
+    if not domains:
+        return jsonify({"error": "domains list required"}), 400
+
+    # резолв доменів у ID
+    org_map, unresolved = resolve_domains_to_orgs(domains)
+    org_ids = list(org_map.keys())
+    if not org_ids:
+        return jsonify({"error": "no orgs resolved", "unresolved": unresolved}), 404
+
+    # будуємо балковий запит з УСІМА фільтрами (людські + компанії разом)
+    body = {
+        "organization_ids": org_ids,
+        "person_seniorities": data.get("seniorities", []),
+        "page": 1,
+        "per_page": BATCH_PER_PAGE,
+        "display_mode": "explorer_mode",
+        "context": "people-index-page",
+        "finder_version": 2,
+    }
+    # фільтри компанії — те, що раніше конфліктувало; пробуємо додати
+    if data.get("num_employees_ranges"):
+        body["organization_num_employees_ranges"] = data["num_employees_ranges"]
+    body.update(data.get("extra_filters", {}))
+
+    result, status = apollo_request(
+        "POST", "https://app.apollo.io/api/v1/mixed_people/search", json=body
+    )
+    if result is None:
+        return jsonify({"apollo_status": status, "note": "запит не пройшов (можливо капча/422)"}), 200
+
+    pagination = result.get("pagination", {})
+    people = result.get("people", [])
+    # зберемо унікальні компанії, що реально повернулись (щоб бачити чи фільтр компанії відсік)
+    companies = {}
+    for p in people:
+        org = p.get("organization", {}) or {}
+        companies[org.get("id", "")] = org.get("name", "")
+
+    return jsonify({
+        "resolved_orgs": len(org_ids),
+        "unresolved": unresolved,
+        "apollo_total_entries": pagination.get("total_entries"),
+        "apollo_total_pages": pagination.get("total_pages"),
+        "people_on_page1": len(people),
+        "companies_returned": list(companies.values()),
+        "sample_people": [{"name": p.get("name"), "title": p.get("title"),
+                           "company": (p.get("organization") or {}).get("name"),
+                           "country": p.get("country")} for p in people[:10]],
+    })
+
 
 @app.route("/whoami", methods=["GET"])
 def whoami():
