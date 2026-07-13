@@ -137,6 +137,10 @@ def apollo_request(method, url, params=None, json=None, **_ignore):
                 _backoff(attempt)
             continue
 
+        if status == 422:
+            print("[apollo_request] 422 — сторінки закінчились (page limit)")
+            return None, 422
+
         if status == 429:
             print("[apollo_request] 429 — ліміт, чекаю")
             if attempt < MAX_RETRIES - 1:
@@ -243,7 +247,10 @@ def search_people(organization_id, seniorities, titles, max_pages=1, extra_filte
             json=body,
         )
         if data is None:
-            print(f"search_people failed (status={status})")
+            if status == 422:
+                print(f"search_people: досягнуто ліміт сторінок на сторінці {page}, зупиняюсь")
+            else:
+                print(f"search_people failed (status={status})")
             break
 
         people_raw = data.get("people", [])
@@ -311,7 +318,10 @@ def search_people_bulk(org_ids, seniorities, titles, max_pages, extra_filters=No
             json=body,
         )
         if data is None:
-            print(f"search_people_bulk failed (status={status})")
+            if status == 422:
+                print(f"search_people_bulk: досягнуто ліміт сторінок на сторінці {page}, зупиняюсь ({len(all_people)} вже зібрано)")
+            else:
+                print(f"search_people_bulk failed (status={status})")
             break
 
         people_raw = data.get("people", [])
