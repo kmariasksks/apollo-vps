@@ -622,6 +622,111 @@ def process_search_job(job_id, params):
         _set_job(job_id, status="error", error=str(e))
         print(f"[job {job_id[:8]}] помилка: {e}")
 
+# ═══════════════════════════════════════════════════════════════════
+# БАЛК-БУФЕР: накопичує домени і обробляє їх пачками
+# ═══════════════════════════════════════════════════════════════════
+
+BATCH_TIMEOUT = float(os.environ.get("BATCH_TIMEOUT", 45))
+DEFAULT_BATCH_SIZE = int(os.environ.get("DEFAULT_BATCH_SIZE", 50))
+
+_batch_buffer = []
+_batch_lock = threading.Lock()
+_batch_last_add = [0.0]
+_current_batch_size = [DEFAULT_BATCH_SIZE]
+
+
+def add_to_batch(job_id, params):
+    bs = int(params.get("batch_size", DEFAULT_BATCH_SIZE))
+    fire = False
+    with _batch_lock:
+        _current_batch_size[0] = bs
+        _batch_buffer.append((job_id, params))
+        _batch_last_add[0] = time.time()
+        n = len(_batch_buffer)
+        if n >= bs:
+            fire = True
+    print(f"[batch] +{params.get('domain')} (у буфері {n}/{bs})")
+    if fire:
+        _flush_batch(f"досягнуто {bs}")
+
+
+def _flush_batch(reason):
+    with _batch_lock:
+        if not _batch_buffer:
+            return
+        items = _batch_buffer[:]
+        _batch_buffer.clear()
+    batch_id = str(uuid.uuid4())
+    print(f"[batch {batch_id[:8]}] запуск балку ({reason}): {len(items)} доменів")
+    _set_job(batch_id, status="queued", kind="batch", size=len(items))
+    _job_queue.put((batch_id, {"__batch_items__": items}))
+
+
+def _batch_watcher():
+    while True:
+        time.sleep(1)
+        with _batch_lock:
+            n = len(_batch_buffer)
+            quiet = (time.time() - _batch_last_add[0]) if _batch_buffer else 0
+            timeout_hit = n > 0 and quiet >= BATCH_TIMEOUT
+        if timeout_hit:
+            _flush_batch(f"тиша {int(quiet)}с, {n} доменів")
+
+
+def process_batch_job(batch_id, items):
+    first = items[0][1]
+    webhook_url = (first.get("webhook_url") or CLAY_WEBHOOK_URL or "").strip()
+    webhook_token = (first.get("webhook_token") or CLAY_WEBHOOK_TOKEN or "").strip()
+    seniorities = first.get("seniorities", ["c_suite", "vp", "director"])
+    titles = first.get("titles", [])
+    extra_filters = first.get("extra_filters", {})
+    max_pages = first.get("max_pages", 10**6)
+    min_e = first.get("min_employees")
+    max_e = first.get("max_employees")
+    excluded = first.get("excluded_industries", [])
+
+    domains = [p["domain"] for _, p in items]
+    print(f"[batch {batch_id[:8]}] резолв {len(domains)} доменів...")
+
+    org_map, unresolved = resolve_domains_to_orgs(domains)
+    if unresolved:
+        print(f"[batch {batch_id[:8]}] не знайдено в Apollo: {unresolved}")
+
+    kept_ids = []
+    for org_id, info in org_map.items():
+        if min_e is not None or max_e is not None or excluded:
+            num_employees, industries = get_account_info(org_id)
+            if (min_e is not None and (num_employees or 0) < min_e) or \
+               (max_e is not None and (num_employees or 10**9) > max_e):
+                print(f"[batch {batch_id[:8]}] {info['domain']}: ПРОПУЩЕНО (працівників {num_employees})")
+                continue
+            if excluded and industries:
+                ex = [i.lower() for i in excluded]
+                hit = next((ind for ind in industries if ind.lower() in ex), None)
+                if hit:
+                    print(f"[batch {batch_id[:8]}] {info['domain']}: ПРОПУЩЕНО (індустрія '{hit}')")
+                    continue
+        kept_ids.append(org_id)
+
+    if not kept_ids:
+        print(f"[batch {batch_id[:8]}] після фільтрів не лишилось компаній")
+        _set_job(batch_id, status="done", people_found=0, people_sent=0)
+        return
+
+    print(f"[batch {batch_id[:8]}] пошук людей по {len(kept_ids)} компаніях (усі сторінки)...")
+    people = search_people_bulk(kept_ids, seniorities, titles, max_pages, extra_filters)
+
+    sent = 0
+    for p in people:
+        oid = p.get("organization_id")
+        info = org_map.get(oid)
+        domain = info["domain"] if info else ""
+        if send_person_to_clay(p, domain, webhook_url, webhook_token):
+            sent += 1
+
+    _set_job(batch_id, status="done", people_found=len(people), people_sent=sent)
+    print(f"[batch {batch_id[:8]}] знайдено {len(people)}, відправлено {sent}")
+
 
 def _worker(worker_id):
     print(f"[worker {worker_id}] запущено")
@@ -632,7 +737,10 @@ def _worker(worker_id):
                 print(f"[worker {worker_id}] капча активна — чекаю, черга на паузі")
                 notify_captcha()
                 time.sleep(15)
-            process_search_job(job_id, params)
+            if isinstance(params, dict) and "__batch_items__" in params:
+                process_batch_job(job_id, params["__batch_items__"])
+            else:
+                process_search_job(job_id, params)
         finally:
             _job_queue.task_done()
             # Якщо черга спорожніла — сповістити, що прогін завершено
@@ -649,6 +757,11 @@ def search_async():
 
     job_id = str(uuid.uuid4())
     _set_job(job_id, status="queued", domain=domain, people_sent=0, error=None)
+
+    if data.get("batch"):
+        add_to_batch(job_id, data)
+        return jsonify({"job_id": job_id, "status": "buffered", "domain": domain})
+
     _job_queue.put((job_id, data))
     return jsonify({"job_id": job_id, "status": "queued", "domain": domain})
 
@@ -698,6 +811,9 @@ def _startup():
     for _i in range(NUM_WORKERS):
         t = threading.Thread(target=_worker, args=(_i + 1,), daemon=True)
         t.start()
+    t_watch = threading.Thread(target=_batch_watcher, daemon=True)
+    t_watch.start()
+    print("Балк-watcher запущено")
 
 
 if __name__ == "__main__":
