@@ -839,6 +839,48 @@ def debug_bulk():
                            "country": p.get("country")} for p in people[:10]],
     })
 
+@app.route("/debug-raw", methods=["POST"])
+def debug_raw():
+    """ДІАГНОСТИКА: сирі поля organization у даних людини (балк)."""
+    data = request.json or {}
+    domains = data.get("domains", [])
+    org_map, unresolved = resolve_domains_to_orgs(domains)
+    org_ids = list(org_map.keys())
+    if not org_ids:
+        return jsonify({"error": "no orgs"}), 404
+
+    body = {
+        "organization_ids": org_ids,
+        "person_seniorities": data.get("seniorities", []),
+        "page": 1,
+        "per_page": 5,
+        "display_mode": "explorer_mode",
+        "context": "people-index-page",
+        "finder_version": 2,
+    }
+    result, status = apollo_request(
+        "POST", "https://app.apollo.io/api/v1/mixed_people/search", json=body
+    )
+    if result is None:
+        return jsonify({"apollo_status": status}), 200
+
+    people = result.get("people", [])
+    if not people:
+        return jsonify({"note": "нема людей", "keys_top": list(result.keys())})
+
+    p = people[0]
+    org = p.get("organization", {}) or {}
+    return jsonify({
+        "person_keys": list(p.keys()),
+        "organization_keys": list(org.keys()),
+        "organization_sample": {
+            "name": org.get("name"),
+            "estimated_num_employees": org.get("estimated_num_employees"),
+            "industry": org.get("industry"),
+            "industries": org.get("industries"),
+            "num_employees": org.get("num_employees"),
+        },
+    })
 
 @app.route("/whoami", methods=["GET"])
 def whoami():
