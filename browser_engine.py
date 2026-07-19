@@ -128,6 +128,7 @@ def _op_browser_fetch(method, url, params, json_body):
         print(f"[browser_fetch] fetch failed: {body[:200]}", flush=True)
         return None, -1
 
+    print(f"[browser_fetch] status={status}, body[:500]={body[:500]!r}", flush=True)
     low = body[:2000].lower()
     if ("turnstile" in low or "cf-challenge" in low
             or "just a moment" in low or "challenges.cloudflare.com" in low):
