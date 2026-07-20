@@ -636,20 +636,32 @@ def process_search_job(job_id, params):
 # БАЛК-БУФЕР: накопичує домени і обробляє їх пачками
 # ═══════════════════════════════════════════════════════════════════
 
-BATCH_TIMEOUT = float(os.environ.get("BATCH_TIMEOUT", 45))
-DEFAULT_BATCH_SIZE = int(os.environ.get("DEFAULT_BATCH_SIZE", 50))
+BATCH_SIZE_MIN = int(os.environ.get("BATCH_SIZE_MIN", 30))
+BATCH_SIZE_MAX = int(os.environ.get("BATCH_SIZE_MAX", 50))
+BATCH_TIMEOUT_MIN = float(os.environ.get("BATCH_TIMEOUT_MIN", 30))
+BATCH_TIMEOUT_MAX = float(os.environ.get("BATCH_TIMEOUT_MAX", 90))
+
+def _pick_batch_size():
+    return random.randint(BATCH_SIZE_MIN, BATCH_SIZE_MAX)
+
+def _pick_batch_timeout():
+    return random.uniform(BATCH_TIMEOUT_MIN, BATCH_TIMEOUT_MAX)
 
 _batch_buffer = []
 _batch_lock = threading.Lock()
 _batch_last_add = [0.0]
-_current_batch_size = [DEFAULT_BATCH_SIZE]
+_current_batch_size = [_pick_batch_size()]
+_current_batch_timeout = [_pick_batch_timeout()]
 
 
 def add_to_batch(job_id, params):
-    bs = int(params.get("batch_size", DEFAULT_BATCH_SIZE))
     fire = False
     with _batch_lock:
-        _current_batch_size[0] = bs
+        if not _batch_buffer:
+            # старт нового буфера — обираємо новий випадковий розмір і таймаут
+            _current_batch_size[0] = _pick_batch_size()
+            _current_batch_timeout[0] = _pick_batch_timeout()
+        bs = _current_batch_size[0]
         _batch_buffer.append((job_id, params))
         _batch_last_add[0] = time.time()
         n = len(_batch_buffer)
@@ -678,9 +690,10 @@ def _batch_watcher():
         with _batch_lock:
             n = len(_batch_buffer)
             quiet = (time.time() - _batch_last_add[0]) if _batch_buffer else 0
-            timeout_hit = n > 0 and quiet >= BATCH_TIMEOUT
+            current_timeout = _current_batch_timeout[0]
+            timeout_hit = n > 0 and quiet >= current_timeout
         if timeout_hit:
-            _flush_batch(f"тиша {int(quiet)}с, {n} доменів")
+            _flush_batch(f"тиша {int(quiet)}с (порог {int(current_timeout)}с), {n} доменів")
 
 
 def process_batch_job(batch_id, items):
