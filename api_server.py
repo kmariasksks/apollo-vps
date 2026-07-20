@@ -906,6 +906,53 @@ def debug_raw():
         },
     })
 
+@app.route("/debug-domain-search", methods=["POST"])
+def debug_domain_search():
+    """ДІАГНОСТИКА: пошук людей БЕЗ резолву доменів у ID.
+    Використовує q_organization_domains замість organization_ids."""
+    data = request.json or {}
+    domains = data.get("domains", [])
+    if not domains:
+        return jsonify({"error": "domains list required"}), 400
+
+    body = {
+        "q_organization_domains": domains,
+        "person_seniorities": data.get("seniorities", []),
+        "page": 1,
+        "per_page": 10,
+        "display_mode": "explorer_mode",
+        "context": "people-index-page",
+        "finder_version": 2,
+    }
+    if data.get("num_employees_ranges"):
+        body["organization_num_employees_ranges"] = data["num_employees_ranges"]
+    body.update(data.get("extra_filters", {}))
+
+    result, status = apollo_request(
+        "POST", "https://app.apollo.io/api/v1/mixed_people/search", json=body
+    )
+    if result is None:
+        return jsonify({"apollo_status": status, "note": "запит не пройшов"}), 200
+
+    pagination = result.get("pagination", {})
+    people = result.get("people", [])
+    companies = {}
+    for p in people:
+        org = p.get("organization", {}) or {}
+        companies[org.get("id", "")] = org.get("name", "(null)")
+
+    return jsonify({
+        "apollo_total_entries": pagination.get("total_entries"),
+        "apollo_total_pages": pagination.get("total_pages"),
+        "people_on_page1": len(people),
+        "companies_returned": list(companies.values()),
+        "sample_people": [{
+            "name": p.get("name"),
+            "title": p.get("title"),
+            "company": (p.get("organization") or {}).get("name") or "(null)",
+        } for p in people[:5]],
+    })
+
 @app.route("/whoami", methods=["GET"])
 def whoami():
     browser_ip = be.check_ip()
