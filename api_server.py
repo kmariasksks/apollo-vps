@@ -50,8 +50,16 @@ NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 2))
 API_KEY = os.environ.get("API_KEY", "").strip()
 CAPTCHA_WEBHOOK_URL = os.environ.get("CAPTCHA_WEBHOOK_URL", "").strip()
 CAPTCHA_PAUSE = float(os.environ.get("CAPTCHA_PAUSE", 120))
+CLAY_WEBHOOK_URL = os.environ.get("CLAY_WEBHOOK_URL", "").strip()
+CLAY_WEBHOOK_TOKEN = os.environ.get("CLAY_WEBHOOK_TOKEN", "").strip()
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 2))
+API_KEY = os.environ.get("API_KEY", "").strip()
+CAPTCHA_WEBHOOK_URL = os.environ.get("CAPTCHA_WEBHOOK_URL", "").strip()
+CAPTCHA_PAUSE = float(os.environ.get("CAPTCHA_PAUSE", 120))
 _last_captcha_notify = [0.0]
 _captcha_active = threading.Event()  # глобальний стоп-кран: капча активна
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()
+_worker_paused = threading.Event()  # ручна пауза воркера (для VNC-роботи)
 
 _throttle_lock = threading.Lock()
 _next_allowed = 0.0
@@ -756,6 +764,9 @@ def _worker(worker_id):
     while True:
         job_id, params = _job_queue.get()
         try:
+            while _worker_paused.is_set():
+                print(f"[worker {worker_id}] ВОРКЕР НА ПАУЗІ — чекаю /resume")
+                time.sleep(5)
             while _captcha_active.is_set():
                 print(f"[worker {worker_id}] капча активна — чекаю, черга на паузі")
                 notify_captcha()
@@ -904,6 +915,24 @@ def whoami():
         "note": "browser_ip має бути резидентським IP проксі, не IP сервера Contabo",
     })
 
+@app.route("/pause", methods=["POST"])
+def pause_worker():
+    provided = request.headers.get("X-Admin-Key", "")
+    if not ADMIN_KEY or provided != ADMIN_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    _worker_paused.set()
+    print("[admin] воркер поставлено на ПАУЗУ через /pause")
+    return jsonify({"status": "paused", "queue_size": _job_queue.qsize()})
+
+
+@app.route("/resume", methods=["POST"])
+def resume_worker():
+    provided = request.headers.get("X-Admin-Key", "")
+    if not ADMIN_KEY or provided != ADMIN_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    _worker_paused.clear()
+    print("[admin] воркер знято з ПАУЗИ через /resume")
+    return jsonify({"status": "resumed", "queue_size": _job_queue.qsize()})
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -912,6 +941,7 @@ def health():
         "proxy_configured": PROXY_CONFIGURED,
         "requests_made": _request_count,
         "session_problem": _session_problem,
+        "paused": _worker_paused.is_set(),
         "browser": be.probe(),
         "webhook_default_configured": bool(CLAY_WEBHOOK_URL),
         "queue_size": _job_queue.qsize(),
