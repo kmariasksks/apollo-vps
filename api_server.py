@@ -916,7 +916,7 @@ def debug_domain_search():
         return jsonify({"error": "domains list required"}), 400
 
     body = {
-        "q_organization_domains": domains,
+        "q_organization_domains_list": domains,
         "person_seniorities": data.get("seniorities", []),
         "page": 1,
         "per_page": 10,
