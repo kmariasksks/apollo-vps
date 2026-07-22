@@ -806,53 +806,49 @@ def process_batch_job(batch_id, items):
     seniorities = first.get("seniorities", ["c_suite", "vp", "director"])
     titles = first.get("titles", [])
     extra_filters = first.get("extra_filters", {})
-    max_pages = first.get("max_pages", 10**6)
+    max_pages = first.get("max_pages", 5)
     min_e = first.get("min_employees")
     max_e = first.get("max_employees")
-    excluded = first.get("excluded_industries", [])
+
+    # Фільтр розміру передаємо прямо в Apollo-запит
+    num_ranges = None
+    if min_e is not None or max_e is not None:
+        lo = int(min_e) if min_e is not None else 1
+        hi = int(max_e) if max_e is not None else 100000
+        num_ranges = [f"{lo},{hi}"]
 
     domains = [p["domain"] for _, p in items]
-    print(f"[batch {batch_id[:8]}] резолв {len(domains)} доменів...")
+    print(f"[batch {batch_id[:8]}] пошук по {len(domains)} доменах одним запитом...")
 
-    org_map, unresolved = resolve_domains_to_orgs(domains)
-    if unresolved:
-        print(f"[batch {batch_id[:8]}] не знайдено в Apollo: {unresolved}")
+    # === ОПТИМІЗОВАНИЙ ШЛЯХ ===
+    # Один запит замість резолву + account_info + окремого пошуку.
+    people = search_people_by_domains(
+        domains=domains,
+        seniorities=seniorities,
+        titles=titles,
+        max_pages=max_pages,
+        extra_filters=extra_filters,
+        num_employees_ranges=num_ranges,
+    )
 
-    kept_ids = []
-    for org_id, info in org_map.items():
-        if min_e is not None or max_e is not None or excluded:
-            num_employees, industries = get_account_info(org_id)
-            if (min_e is not None and (num_employees or 0) < min_e) or \
-               (max_e is not None and (num_employees or 10**9) > max_e):
-                print(f"[batch {batch_id[:8]}] {info['domain']}: ПРОПУЩЕНО (працівників {num_employees})")
-                continue
-            if excluded and industries:
-                ex = [i.lower() for i in excluded]
-                hit = next((ind for ind in industries if ind.lower() in ex), None)
-                if hit:
-                    print(f"[batch {batch_id[:8]}] {info['domain']}: ПРОПУЩЕНО (індустрія '{hit}')")
-                    continue
-        kept_ids.append(org_id)
-
-    if not kept_ids:
-        print(f"[batch {batch_id[:8]}] після фільтрів не лишилось компаній")
+    if not people:
+        print(f"[batch {batch_id[:8]}] 0 людей за фільтрами")
         _set_job(batch_id, status="done", people_found=0, people_sent=0)
         return
 
-    print(f"[batch {batch_id[:8]}] пошук людей по {len(kept_ids)} компаніях (усі сторінки)...")
-    people = search_people_bulk(kept_ids, seniorities, titles, max_pages, extra_filters)
-
+    # Відправка в Clay з правильним matched_domain
     sent = 0
+    per_domain_count = {}
     for p in people:
-        oid = p.get("organization_id")
-        info = org_map.get(oid)
-        domain = info["domain"] if info else ""
-        if send_person_to_clay(p, domain, webhook_url, webhook_token):
+        person_domain = p.get("matched_domain") or ""
+        per_domain_count[person_domain] = per_domain_count.get(person_domain, 0) + 1
+        if send_person_to_clay(p, person_domain, webhook_url, webhook_token):
             sent += 1
 
     _set_job(batch_id, status="done", people_found=len(people), people_sent=sent)
     print(f"[batch {batch_id[:8]}] знайдено {len(people)}, відправлено {sent}")
-
+    for d, c in sorted(per_domain_count.items(), key=lambda x: -x[1]):
+        print(f"[batch {batch_id[:8]}]   {d}: {c} людей")
 
 def _worker(worker_id):
     print(f"[worker {worker_id}] запущено")
