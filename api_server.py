@@ -1138,6 +1138,52 @@ def debug_domain_search():
         } for p in people[:5]],
     })
 
+@app.route("/debug-companies-search", methods=["POST"])
+def debug_companies_search():
+    """ДІАГНОСТИКА: пошук компаній через mixed_companies/search + q_organization_domains_list."""
+    data = request.json or {}
+    domains = data.get("domains", [])
+    if not domains:
+        return jsonify({"error": "domains list required"}), 400
+
+    body = {
+        "q_organization_domains_list": domains,
+        "page": 1,
+        "per_page": 25,
+        "display_mode": "explorer_mode",
+    }
+
+    result, status = apollo_request(
+        "POST", "https://app.apollo.io/api/v1/mixed_companies/search", json=body
+    )
+    if result is None:
+        return jsonify({"apollo_status": status, "note": "запит не пройшов"}), 200
+
+    pagination = result.get("pagination", {})
+    orgs = result.get("organizations", []) or result.get("accounts", []) or []
+
+    sample_data = []
+    for org in orgs[:5]:
+        sample_data.append({
+            "name": org.get("name"),
+            "domain": org.get("primary_domain") or org.get("website_url"),
+            "industry": org.get("industry"),
+            "employees": org.get("estimated_num_employees"),
+            "revenue": org.get("organization_revenue_printed") or org.get("organization_revenue"),
+            "funding": org.get("total_funding_printed") or org.get("total_funding"),
+            "technologies_count": len(org.get("technology_names", []) or []),
+            "has_linkedin": bool(org.get("linkedin_url")),
+            "founded_year": org.get("founded_year"),
+        })
+
+    return jsonify({
+        "apollo_total_entries": pagination.get("total_entries"),
+        "apollo_total_pages": pagination.get("total_pages"),
+        "orgs_returned": len(orgs),
+        "sample_orgs": sample_data,
+        "keys_in_first_org": list(orgs[0].keys()) if orgs else [],
+    })
+
 @app.route("/whoami", methods=["GET"])
 def whoami():
     browser_ip = be.check_ip()
