@@ -459,19 +459,22 @@ def search_people_by_domains(
         for p in people_on_page:
             matched = _map_person_to_domain(p, domains)
             org = p.get("organization") or {}
+            first = p.get("first_name") or ""
+            last = p.get("last_name") or ""
+            full_name = (first + " " + last).strip() or (p.get("name") or "")
             all_people.append({
-                "name": (p.get("first_name", "") + " " + p.get("last_name", "")).strip() or p.get("name", ""),
-                "first_name": p.get("first_name", ""),
-                "last_name": p.get("last_name", ""),
-                "title": p.get("title", ""),
-                "seniority": p.get("seniority", ""),
+                "name": full_name,
+                "first_name": first,
+                "last_name": last,
+                "title": p.get("title") or "",
+                "seniority": p.get("seniority") or "",
                 "linkedin_url": p.get("linkedin_url"),
                 "city": p.get("city"),
                 "state": p.get("state"),
                 "country": p.get("country"),
                 "headline": p.get("headline"),
-                "company": org.get("name", ""),
-                "company_domain": org.get("website_url", ""),
+                "company": org.get("name") or "",
+                "company_domain": org.get("website_url") or "",
                 "matched_domain": matched,
             })
 
