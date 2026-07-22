@@ -1191,6 +1191,6 @@ if __name__ == "__main__":
     _startup()
     print("Сервер запущено")
     print(f"Proxy: {'налаштовано' if PROXY_CONFIGURED else 'НЕ налаштовано'}")
-    print(f"Throttle: {NORMAL_DELAY_MIN}-{NORMAL_DELAY_MAX}s, пауза кожні {PAUSE_EVERY}")
+    print(f"Throttle: log-normal (μ={DELAY_LOGNORM_MU}, σ={DELAY_LOGNORM_SIGMA}), pause every {PAUSE_EVERY_MIN}-{PAUSE_EVERY_MAX} req")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5001)),
             debug=False, threaded=True, use_reloader=False)
