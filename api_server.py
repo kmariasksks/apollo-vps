@@ -120,6 +120,43 @@ def notify_done():
     except Exception as e:
         print(f"[done] не вдалось сповістити: {e}")
 
+def _extract_domain_from_url(url):
+    """Витягує чистий домен з website_url (без http://, без www.)."""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url if "://" in url else "http://" + url)
+        host = (parsed.netloc or parsed.path or "").lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        # відрізати порт якщо є
+        host = host.split(":")[0].split("/")[0]
+        return host
+    except Exception:
+        return ""
+
+
+def _map_person_to_domain(person, input_domains):
+    """Мінімальна стратегія мапінгу organization → domain.
+    Якщо website_url точно збігається з якимось з input_domains — беремо його.
+    Якщо ні — беремо чистий домен з website_url.
+    Це treated as tech debt — потім доопрацювати.
+    """
+    org = person.get("organization") or {}
+    website_url = org.get("website_url") or ""
+    extracted = _extract_domain_from_url(website_url)
+
+    # нормалізуємо вхідні домени для порівняння
+    normalized_input = {d.lower().strip().lstrip("www.") for d in input_domains if d}
+
+    # точний матч
+    if extracted and extracted in normalized_input:
+        return extracted
+
+    # fallback — беремо що витягли з website_url
+    return extracted or "(unknown)"
+
 def apollo_request(method, url, params=None, json=None, **_ignore):
     global _session_problem
     last_status = None
@@ -288,6 +325,87 @@ def search_people(organization_id, seniorities, titles, max_pages=1, extra_filte
 
     return all_people
 
+def search_people_by_domains(
+    domains,
+    seniorities=None,
+    titles=None,
+    max_pages=5,
+    extra_filters=None,
+    num_employees_ranges=None,
+):
+    """Оптимізований пошук людей через q_organization_domains_list.
+
+    Один запит на групу з N доменів замість триетапного ланцюга.
+    Пагінує до max_pages, повертає список людей з полем matched_domain.
+    """
+    if not domains:
+        return []
+
+    all_people = []
+
+    body_base = {
+        "q_organization_domains_list": list(domains),
+        "page": 1,
+        "per_page": BATCH_PER_PAGE,
+        "display_mode": "explorer_mode",
+        "context": "people-index-page",
+        "finder_version": 2,
+    }
+    if seniorities:
+        body_base["person_seniorities"] = list(seniorities)
+    if titles:
+        body_base["person_titles"] = list(titles)
+    if num_employees_ranges:
+        body_base["organization_num_employees_ranges"] = list(num_employees_ranges)
+    if extra_filters and isinstance(extra_filters, dict):
+        body_base.update(extra_filters)
+
+    page = 1
+    while page <= max_pages:
+        body = dict(body_base)
+        body["page"] = page
+
+        data, status = apollo_request(
+            "POST",
+            "https://app.apollo.io/api/v1/mixed_people/search",
+            json=body,
+        )
+        if data is None:
+            print(f"[search_by_domains] сторінка {page}: запит не пройшов (status={status})", flush=True)
+            break
+
+        people_on_page = data.get("people", []) or []
+        pagination = data.get("pagination", {}) or {}
+        total_pages = pagination.get("total_pages", 0) or 0
+
+        for p in people_on_page:
+            matched = _map_person_to_domain(p, domains)
+            org = p.get("organization") or {}
+            all_people.append({
+                "name": (p.get("first_name", "") + " " + p.get("last_name", "")).strip() or p.get("name", ""),
+                "first_name": p.get("first_name", ""),
+                "last_name": p.get("last_name", ""),
+                "title": p.get("title", ""),
+                "seniority": p.get("seniority", ""),
+                "linkedin_url": p.get("linkedin_url"),
+                "city": p.get("city"),
+                "state": p.get("state"),
+                "country": p.get("country"),
+                "headline": p.get("headline"),
+                "company": org.get("name", ""),
+                "company_domain": org.get("website_url", ""),
+                "matched_domain": matched,
+            })
+
+        print(f"[search_by_domains] сторінка {page}/{total_pages}: +{len(people_on_page)} людей", flush=True)
+
+        # якщо це остання сторінка або порожня
+        if page >= total_pages or len(people_on_page) == 0:
+            break
+
+        page += 1
+
+    return all_people
 
 def resolve_domains_to_orgs(domains):
     org_map = {}
@@ -360,7 +478,6 @@ def search_people_bulk(org_ids, seniorities, titles, max_pages, extra_filters=No
 
     return all_people
 
-
 @app.route("/search", methods=["POST"])
 def search():
     data = request.json
@@ -371,43 +488,30 @@ def search():
     extra_filters = data.get("extra_filters", {})
     min_employees = data.get("min_employees")
     max_employees = data.get("max_employees")
-    excluded_industries = data.get("excluded_industries", [])
 
     if not domain:
         return jsonify({"error": "domain is required"}), 400
 
     print(f"Запит /search: {domain}")
 
-    org_basic, _ = get_organization_data(domain)
-    if not org_basic:
-        return jsonify({"error": f"Company not found: {domain}"}), 404
-
-    org_id = org_basic["id"]
-    num_employees, industries = get_account_info(org_id)
-
+    # === ОПТИМІЗОВАНИЙ ШЛЯХ ===
+    num_ranges = None
     if min_employees is not None or max_employees is not None:
-        if num_employees is None:
-            return jsonify({"domain": domain, "total": 0, "people": [],
-                            "skipped_reason": "employee count unknown"})
-        if min_employees is not None and num_employees < min_employees:
-            return jsonify({"domain": domain, "total": 0, "people": [],
-                            "skipped_reason": f"employees={num_employees} below min={min_employees}"})
-        if max_employees is not None and num_employees > max_employees:
-            return jsonify({"domain": domain, "total": 0, "people": [],
-                            "skipped_reason": f"employees={num_employees} above max={max_employees}"})
+        lo = int(min_employees) if min_employees is not None else 1
+        hi = int(max_employees) if max_employees is not None else 100000
+        num_ranges = [f"{lo},{hi}"]
 
-    if excluded_industries and industries:
-        excluded_lower = [i.lower() for i in excluded_industries]
-        for ind in industries:
-            if ind.lower() in excluded_lower:
-                return jsonify({"domain": domain, "total": 0, "people": [],
-                                "skipped_reason": f"industry '{ind}' is excluded"})
+    people = search_people_by_domains(
+        domains=[domain],
+        seniorities=seniorities,
+        titles=titles,
+        max_pages=max_pages,
+        extra_filters=extra_filters,
+        num_employees_ranges=num_ranges,
+    )
 
-    people = search_people(org_id, seniorities, titles, max_pages, extra_filters)
     print(f"Знайдено: {len(people)} для {domain}")
-
     return jsonify({"domain": domain, "total": len(people), "people": people})
-
 
 @app.route("/company", methods=["POST"])
 def company():
@@ -592,45 +696,36 @@ def process_search_job(job_id, params):
 
     _set_job(job_id, status="processing")
     try:
-        org_basic, _ = get_organization_data(domain)
-        if not org_basic:
-            _set_job(job_id, status="not_found", people_sent=0,
-                     error=f"Company not found: {domain}")
-            print(f"[job {job_id[:8]}] {domain}: НЕ ЗНАЙДЕНО в Apollo")
-            return
-
-        org_id = org_basic["id"]
+        # === ОПТИМІЗОВАНИЙ ШЛЯХ через q_organization_domains_list ===
+        # Один запит замість триетапного ланцюга resolve→account_info→search.
         min_e = params.get("min_employees")
         max_e = params.get("max_employees")
-        excluded = params.get("excluded_industries", [])
-        if min_e is not None or max_e is not None or excluded:
-            num_employees, industries = get_account_info(org_id)
-            if (min_e is not None and (num_employees or 0) < min_e) or \
-               (max_e is not None and (num_employees or 10**9) > max_e):
-                _set_job(job_id, status="skipped", people_sent=0,
-                         error=f"employees={num_employees} поза діапазоном")
-                print(f"[job {job_id[:8]}] {domain}: ПРОПУЩЕНО (працівників {num_employees} поза діапазоном)")
-                return
-            if excluded and industries:
-                ex = [i.lower() for i in excluded]
-                hit = next((ind for ind in industries if ind.lower() in ex), None)
-                if hit:
-                    _set_job(job_id, status="skipped", people_sent=0,
-                             error=f"industry '{hit}' excluded")
-                    print(f"[job {job_id[:8]}] {domain}: ПРОПУЩЕНО (індустрія '{hit}' виключена)")
-                    return
+        num_ranges = None
+        if min_e is not None or max_e is not None:
+            lo = int(min_e) if min_e is not None else 1
+            hi = int(max_e) if max_e is not None else 100000
+            num_ranges = [f"{lo},{hi}"]
 
-        people = search_people(
-            org_id,
-            params.get("seniorities", ["c_suite", "vp", "director"]),
-            params.get("titles", []),
-            params.get("max_pages", 1),
-            params.get("extra_filters", {}),
+        people = search_people_by_domains(
+            domains=[domain],
+            seniorities=params.get("seniorities", ["c_suite", "vp", "director"]),
+            titles=params.get("titles", []),
+            max_pages=params.get("max_pages", 1),
+            extra_filters=params.get("extra_filters", {}),
+            num_employees_ranges=num_ranges,
         )
 
+        if not people:
+            _set_job(job_id, status="done", people_found=0, people_sent=0)
+            print(f"[job {job_id[:8]}] {domain}: 0 людей (можливо не в Apollo або поза фільтрами)")
+            return
+
+        # Відправка в Clay
         sent = 0
         for p in people:
-            if send_person_to_clay(p, domain, webhook_url, webhook_token):
+            # використовуємо matched_domain (може відрізнятись від вхідного)
+            person_domain = p.get("matched_domain") or domain
+            if send_person_to_clay(p, person_domain, webhook_url, webhook_token):
                 sent += 1
 
         _set_job(job_id, status="done", people_found=len(people), people_sent=sent)
