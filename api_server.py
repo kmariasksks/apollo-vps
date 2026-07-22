@@ -31,11 +31,25 @@ def _check_api_key():
 
 PROXY_CONFIGURED = bool(os.environ.get("PROXY_SERVER", "").strip())
 
-NORMAL_DELAY_MIN = float(os.environ.get("DELAY_MIN", 3))
-NORMAL_DELAY_MAX = float(os.environ.get("DELAY_MAX", 8))
-PAUSE_EVERY = int(os.environ.get("PAUSE_EVERY", 30))
-PAUSE_MIN = float(os.environ.get("PAUSE_MIN", 15))
-PAUSE_MAX = float(os.environ.get("PAUSE_MAX", 30))
+# Базові обмежувачі затримок (щоб log-normal не давав абсурдів)
+NORMAL_DELAY_MIN = float(os.environ.get("DELAY_MIN", 5))
+NORMAL_DELAY_MAX = float(os.environ.get("DELAY_MAX", 90))
+
+# Log-normal параметри (mu=2.5, sigma=0.4 → медіана ~12с, пік 8-20с, хвіст до ~40с)
+DELAY_LOGNORM_MU = float(os.environ.get("DELAY_LOGNORM_MU", 2.5))
+DELAY_LOGNORM_SIGMA = float(os.environ.get("DELAY_LOGNORM_SIGMA", 0.4))
+
+# Періодична пауза "перерва на каву"
+PAUSE_EVERY_MIN = int(os.environ.get("PAUSE_EVERY_MIN", 25))
+PAUSE_EVERY_MAX = int(os.environ.get("PAUSE_EVERY_MAX", 35))
+PAUSE_MIN = float(os.environ.get("PAUSE_MIN", 60))
+PAUSE_MAX = float(os.environ.get("PAUSE_MAX", 120))
+
+# Робочі години (Київ, UTC+3 літом)
+WORK_HOURS_START = int(os.environ.get("WORK_HOURS_START", 7))
+WORK_HOURS_END = int(os.environ.get("WORK_HOURS_END", 18))
+WORK_HOURS_JITTER_MIN = int(os.environ.get("WORK_HOURS_JITTER_MIN", 15))
+WORK_TZ_OFFSET = int(os.environ.get("WORK_TZ_OFFSET", 3))
 
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 5))
 BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", 10))
@@ -64,22 +78,86 @@ _worker_paused = threading.Event()  # ручна пауза воркера (дл
 _throttle_lock = threading.Lock()
 _next_allowed = 0.0
 _request_count = 0
+_next_pause_at = random.randint(PAUSE_EVERY_MIN, PAUSE_EVERY_MAX)  # коли зробити наступну "перерву"
 _session_problem = False
+
+def _work_window_today():
+    """Повертає (start_minute, end_minute) сьогоднішнього робочого вікна у Києві.
+    Jitter детермінований за датою — щоб протягом одного дня межі не стрибали.
+    """
+    import datetime as _dt
+    now_kyiv = _dt.datetime.utcnow() + _dt.timedelta(hours=WORK_TZ_OFFSET)
+    # Детерміністичний seed з дати — jitter однаковий весь день
+    day_seed = now_kyiv.year * 10000 + now_kyiv.month * 100 + now_kyiv.day
+    rng = random.Random(day_seed)
+    start_jitter = rng.randint(-WORK_HOURS_JITTER_MIN, WORK_HOURS_JITTER_MIN)
+    end_jitter = rng.randint(-WORK_HOURS_JITTER_MIN, WORK_HOURS_JITTER_MIN)
+    start_minute = WORK_HOURS_START * 60 + start_jitter
+    end_minute = WORK_HOURS_END * 60 + end_jitter
+    return start_minute, end_minute
+
+
+def _is_work_hours():
+    """Чи зараз робочий час у Києві (з денним jitter)?"""
+    import datetime as _dt
+    now_kyiv = _dt.datetime.utcnow() + _dt.timedelta(hours=WORK_TZ_OFFSET)
+    now_minute = now_kyiv.hour * 60 + now_kyiv.minute
+    start_min, end_min = _work_window_today()
+    return start_min <= now_minute < end_min
+
+
+def _seconds_to_next_work_start():
+    """Скільки секунд спати до початку наступного робочого дня."""
+    import datetime as _dt
+    now_kyiv = _dt.datetime.utcnow() + _dt.timedelta(hours=WORK_TZ_OFFSET)
+    start_min, end_min = _work_window_today()
+    now_minute = now_kyiv.hour * 60 + now_kyiv.minute
+
+    if now_minute < start_min:
+        # ще не почалось сьогодні
+        seconds_to_start = (start_min - now_minute) * 60 - now_kyiv.second
+    else:
+        # вже вечір, чекаємо до завтра — але jitter завтрашнього дня буде інший
+        # тому просто беремо "завтра 7:00" плюс приблизна оцінка
+        tomorrow_min = start_min + 24 * 60
+        seconds_to_start = (tomorrow_min - now_minute) * 60 - now_kyiv.second
+
+    return max(60, seconds_to_start)  # не менше 60с щоб уникнути циклів
+
+
+def _pick_delay():
+    """Log-normal затримка з обмежувачами."""
+    delay = random.lognormvariate(DELAY_LOGNORM_MU, DELAY_LOGNORM_SIGMA)
+    return max(NORMAL_DELAY_MIN, min(NORMAL_DELAY_MAX, delay))
 
 
 def _throttle():
-    global _next_allowed, _request_count
+    global _next_allowed, _request_count, _next_pause_at
+
+    # 1. Перевірка робочих годин — якщо ні, чекаємо до початку робочого дня
+    if not _is_work_hours():
+        sleep_seconds = _seconds_to_next_work_start()
+        wake_at = time.strftime("%H:%M", time.localtime(time.time() + sleep_seconds))
+        print(f"[throttle] поза робочими годинами, сплю до {wake_at} ({int(sleep_seconds)}с)", flush=True)
+        time.sleep(sleep_seconds)
+
+    # 2. Log-normal затримка + періодична пауза
     with _throttle_lock:
         now = time.time()
-        delay = random.uniform(NORMAL_DELAY_MIN, NORMAL_DELAY_MAX)
+        delay = _pick_delay()
         _request_count += 1
-        if PAUSE_EVERY > 0 and _request_count % PAUSE_EVERY == 0:
+
+        if _request_count >= _next_pause_at:
             extra = random.uniform(PAUSE_MIN, PAUSE_MAX)
-            print(f"[throttle] periodic pause +{extra:.1f}s after {_request_count} requests")
+            print(f"[throttle] periodic pause +{extra:.1f}s after {_request_count} requests", flush=True)
             delay += extra
+            # наступна пауза буде через PAUSE_EVERY_MIN..PAUSE_EVERY_MAX запитів
+            _next_pause_at = _request_count + random.randint(PAUSE_EVERY_MIN, PAUSE_EVERY_MAX)
+
         start_at = max(now, _next_allowed)
         _next_allowed = start_at + delay
         wait = start_at - now
+
     if wait > 0:
         time.sleep(wait)
 
@@ -1086,8 +1164,13 @@ def health():
         "workers": NUM_WORKERS,
         "throttle": {
             "delay_range": [NORMAL_DELAY_MIN, NORMAL_DELAY_MAX],
-            "pause_every": PAUSE_EVERY,
+            "delay_lognorm": {"mu": DELAY_LOGNORM_MU, "sigma": DELAY_LOGNORM_SIGMA},
+            "pause_every_range": [PAUSE_EVERY_MIN, PAUSE_EVERY_MAX],
             "pause_range": [PAUSE_MIN, PAUSE_MAX],
+            "next_pause_at": _next_pause_at,
+            "requests_made": _request_count,
+            "work_hours": [WORK_HOURS_START, WORK_HOURS_END],
+            "is_work_hours": _is_work_hours(),
         },
     })
 
