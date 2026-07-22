@@ -800,11 +800,17 @@ def process_search_job(job_id, params):
 
         # Відправка в Clay
         sent = 0
+        skipped_unknown = 0
         for p in people:
-            # використовуємо matched_domain (може відрізнятись від вхідного)
-            person_domain = p.get("matched_domain") or domain
+            person_domain = p.get("matched_domain") or ""
+            # Пропускаємо людей без чіткої привʼязки
+            if not person_domain or person_domain == "(unknown)":
+                skipped_unknown += 1
+                continue
             if send_person_to_clay(p, person_domain, webhook_url, webhook_token):
                 sent += 1
+        if skipped_unknown:
+            print(f"[job {job_id[:8]}] {domain}: пропущено {skipped_unknown} людей без чіткого домену")
 
         _set_job(job_id, status="done", people_found=len(people), people_sent=sent)
         print(f"[job {job_id[:8]}] {domain}: знайдено {len(people)}, відправлено {sent}")
@@ -916,12 +922,19 @@ def process_batch_job(batch_id, items):
 
     # Відправка в Clay з правильним matched_domain
     sent = 0
+    skipped_unknown = 0
     per_domain_count = {}
     for p in people:
         person_domain = p.get("matched_domain") or ""
+        # Пропускаємо людей без чіткої привʼязки до домену (organization.website_url був порожній)
+        if not person_domain or person_domain == "(unknown)":
+            skipped_unknown += 1
+            continue
         per_domain_count[person_domain] = per_domain_count.get(person_domain, 0) + 1
         if send_person_to_clay(p, person_domain, webhook_url, webhook_token):
             sent += 1
+    if skipped_unknown:
+        print(f"[batch {batch_id[:8]}] пропущено {skipped_unknown} людей без чіткого домену")
 
     _set_job(batch_id, status="done", people_found=len(people), people_sent=sent)
     print(f"[batch {batch_id[:8]}] знайдено {len(people)}, відправлено {sent}")
