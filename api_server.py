@@ -1184,6 +1184,61 @@ def debug_companies_search():
         "keys_in_first_org": list(orgs[0].keys()) if orgs else [],
     })
 
+@app.route("/debug-bulk-enrich", methods=["POST"])
+def debug_bulk_enrich():
+    """ДІАГНОСТИКА: bulk enrichment через internal API.
+    Тестуємо чи internal /organizations/bulk_enrich працює через browser session
+    і чи повертає повний набір полів без витрачання credits."""
+    data = request.json or {}
+    domains = data.get("domains", [])
+    if not domains:
+        return jsonify({"error": "domains list required"}), 400
+    if len(domains) > 10:
+        return jsonify({"error": "max 10 domains per bulk_enrich"}), 400
+
+    # Спроба 1: query params з domains[]
+    from urllib.parse import urlencode
+    params = [("domains[]", d) for d in domains]
+    url = "https://app.apollo.io/api/v1/organizations/bulk_enrich?" + urlencode(params)
+
+    result, status = apollo_request("POST", url, json={})
+
+    if result is None:
+        return jsonify({
+            "apollo_status": status,
+            "note": "запит не пройшов через internal API",
+            "url_tried": url,
+        }), 200
+
+    orgs = result.get("organizations", []) or []
+
+    sample_data = []
+    for org in orgs[:5]:
+        sample_data.append({
+            "name": org.get("name"),
+            "domain": org.get("primary_domain") or org.get("website_url"),
+            "industry": org.get("industry"),
+            "industries": org.get("industries"),
+            "employees": org.get("estimated_num_employees"),
+            "revenue": org.get("organization_revenue_printed") or org.get("organization_revenue"),
+            "funding": org.get("total_funding_printed") or org.get("total_funding"),
+            "funding_stage": org.get("latest_funding_stage"),
+            "technologies_count": len(org.get("technology_names", []) or []),
+            "founded_year": org.get("founded_year"),
+            "has_linkedin": bool(org.get("linkedin_url")),
+            "city": org.get("city"),
+            "state": org.get("state"),
+            "country": org.get("country"),
+        })
+
+    return jsonify({
+        "orgs_returned": len(orgs),
+        "response_top_keys": list(result.keys()),
+        "sample_orgs": sample_data,
+        "keys_in_first_org": list(orgs[0].keys()) if orgs else [],
+        "has_credit_message": "credit" in str(result).lower() or "upgrade" in str(result).lower(),
+    })
+
 @app.route("/whoami", methods=["GET"])
 def whoami():
     browser_ip = be.check_ip()
