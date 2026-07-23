@@ -1241,18 +1241,44 @@ def debug_bulk_enrich():
 
 @app.route("/debug-jobs-search", methods=["POST"])
 def debug_jobs_search():
-    """ДІАГНОСТИКА: /newsfeed_events/search — чи можна батчити jobs по декільком компаніям одразу.
+    """ДІАГНОСТИКА jobs — 4 режими:
 
-    Дві гіпотези тестуємо параметрами:
-    - mode=domains → тестуємо q_organization_domains_list
-    - mode=org_ids → тестуємо організації через ids (треба спершу resolve)
+    - mode=domains       → newsfeed_events + q_organization_domains_list (без резолву)
+    - mode=org_ids       → newsfeed_events + organization_ids: [масив org_ids] (батч)
+    - mode=single_org_id → newsfeed_events + organization_ids: [один org_id] (чи є метадані?)
+    - mode=job_postings  → GET /organizations/{id}/job_postings (окремий endpoint)
     """
     data = request.json or {}
     domains = data.get("domains", [])
-    mode = data.get("mode", "domains")  # "domains" або "org_ids"
+    mode = data.get("mode", "domains")
     if not domains:
         return jsonify({"error": "domains list required"}), 400
 
+    # ── Режим 4: пробуємо окремий endpoint /organizations/{id}/job_postings ──
+    if mode == "job_postings":
+        org_map, unresolved = resolve_domains_to_orgs(domains[:1])
+        org_ids = list(org_map.keys())
+        if not org_ids:
+            return jsonify({"error": "no orgs resolved", "unresolved": unresolved}), 200
+        first_org_id = org_ids[0]
+        url = f"https://app.apollo.io/api/v1/organizations/{first_org_id}/job_postings"
+        result, status = apollo_request("GET", url)
+        if result is None:
+            return jsonify({
+                "apollo_status": status,
+                "note": "endpoint не існує або відкинутий",
+                "url_tried": url,
+                "org_id_used": first_org_id,
+            }), 200
+        return jsonify({
+            "mode": "job_postings",
+            "org_id_used": first_org_id,
+            "url_tried": url,
+            "response_top_keys": list(result.keys()) if isinstance(result, dict) else "not_a_dict",
+            "raw_full_response": result,
+        })
+
+    # ── Режими 1-3: newsfeed_events/search з різними параметрами ──
     body = {
         "newsfeed_event_types": ["job_added"],
         "page": 1,
@@ -1262,15 +1288,22 @@ def debug_jobs_search():
     if mode == "domains":
         body["q_organization_domains_list"] = domains
     elif mode == "org_ids":
-        # Резолвимо кожен домен спершу
-        from api_server import resolve_domains_to_orgs  # локальний імпорт для тесту
         org_map, unresolved = resolve_domains_to_orgs(domains)
         org_ids = list(org_map.keys())
         if not org_ids:
             return jsonify({"error": "no orgs resolved", "unresolved": unresolved}), 200
         body["organization_ids"] = org_ids
+    elif mode == "single_org_id":
+        # Тестуємо чи метадані заповнені, якщо в масиві ТІЛЬКИ ОДИН id
+        org_map, unresolved = resolve_domains_to_orgs(domains[:1])
+        org_ids = list(org_map.keys())
+        if not org_ids:
+            return jsonify({"error": "no orgs resolved", "unresolved": unresolved}), 200
+        body["organization_ids"] = org_ids  # масив з одним елементом
     else:
-        return jsonify({"error": "mode must be 'domains' or 'org_ids'"}), 400
+        return jsonify({
+            "error": "mode must be 'domains', 'org_ids', 'single_org_id', or 'job_postings'"
+        }), 400
 
     result, status = apollo_request(
         "POST",
@@ -1288,7 +1321,7 @@ def debug_jobs_search():
     events = result.get("newsfeed_events", []) or []
     pagination = result.get("pagination", {}) or {}
 
-    # Дивимось, скільки різних компаній повернулось
+    # Розкладка перших 10 events (для наочності)
     orgs_in_results = set()
     sample_events = []
     for event in events[:10]:
@@ -1298,7 +1331,9 @@ def debug_jobs_search():
         sample_events.append({
             "org_name": org.get("name") or event.get("organization_name"),
             "org_domain": (org.get("website_url") or "").replace("http://", "").replace("www.", ""),
+            "org_id": org.get("id") or event.get("organization_id"),
             "title": job.get("title") or event.get("title"),
+            "url": job.get("url") or event.get("url"),
             "posted_at": event.get("posted_at"),
             "city": event.get("city"),
             "country": event.get("country"),
@@ -1307,12 +1342,14 @@ def debug_jobs_search():
     return jsonify({
         "mode": mode,
         "domains_sent": len(domains),
+        "org_ids_sent": body.get("organization_ids", []),
         "events_returned": len(events),
         "unique_orgs_in_results": len(orgs_in_results),
-        "orgs_list": sorted(orgs_in_results, key=lambda x: (x or "")),
+        "orgs_list": sorted([o for o in orgs_in_results if o]),
         "pagination": pagination,
         "sample_events": sample_events,
         "response_top_keys": list(result.keys()),
+        "raw_first_event": events[0] if events else None,
     })
 
 @app.route("/whoami", methods=["GET"])
