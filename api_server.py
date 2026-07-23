@@ -1193,8 +1193,8 @@ def debug_bulk_enrich():
     domains = data.get("domains", [])
     if not domains:
         return jsonify({"error": "domains list required"}), 400
-    if len(domains) > 10:
-        return jsonify({"error": "max 10 domains per bulk_enrich"}), 400
+    if len(domains) > 50:
+        return jsonify({"error": "max 50 domains per bulk_enrich"}), 400
 
     # Спроба 1: query params з domains[]
     from urllib.parse import urlencode
