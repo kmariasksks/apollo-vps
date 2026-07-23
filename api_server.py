@@ -1239,6 +1239,82 @@ def debug_bulk_enrich():
         "has_credit_message": "credit" in str(result).lower() or "upgrade" in str(result).lower(),
     })
 
+@app.route("/debug-jobs-search", methods=["POST"])
+def debug_jobs_search():
+    """ДІАГНОСТИКА: /newsfeed_events/search — чи можна батчити jobs по декільком компаніям одразу.
+
+    Дві гіпотези тестуємо параметрами:
+    - mode=domains → тестуємо q_organization_domains_list
+    - mode=org_ids → тестуємо організації через ids (треба спершу resolve)
+    """
+    data = request.json or {}
+    domains = data.get("domains", [])
+    mode = data.get("mode", "domains")  # "domains" або "org_ids"
+    if not domains:
+        return jsonify({"error": "domains list required"}), 400
+
+    body = {
+        "newsfeed_event_types": ["job_added"],
+        "page": 1,
+        "per_page": 25,
+    }
+
+    if mode == "domains":
+        body["q_organization_domains_list"] = domains
+    elif mode == "org_ids":
+        # Резолвимо кожен домен спершу
+        from api_server import resolve_domains_to_orgs  # локальний імпорт для тесту
+        org_map, unresolved = resolve_domains_to_orgs(domains)
+        org_ids = list(org_map.keys())
+        if not org_ids:
+            return jsonify({"error": "no orgs resolved", "unresolved": unresolved}), 200
+        body["organization_ids"] = org_ids
+    else:
+        return jsonify({"error": "mode must be 'domains' or 'org_ids'"}), 400
+
+    result, status = apollo_request(
+        "POST",
+        "https://app.apollo.io/api/v1/newsfeed_events/search",
+        json=body,
+    )
+    if result is None:
+        return jsonify({
+            "apollo_status": status,
+            "note": "запит не пройшов",
+            "mode": mode,
+            "body_sent": body,
+        }), 200
+
+    events = result.get("newsfeed_events", []) or []
+    pagination = result.get("pagination", {}) or {}
+
+    # Дивимось, скільки різних компаній повернулось
+    orgs_in_results = set()
+    sample_events = []
+    for event in events[:10]:
+        org = event.get("organization", {}) or {}
+        job = event.get("job", {}) or {}
+        orgs_in_results.add(org.get("name") or event.get("organization_name"))
+        sample_events.append({
+            "org_name": org.get("name") or event.get("organization_name"),
+            "org_domain": (org.get("website_url") or "").replace("http://", "").replace("www.", ""),
+            "title": job.get("title") or event.get("title"),
+            "posted_at": event.get("posted_at"),
+            "city": event.get("city"),
+            "country": event.get("country"),
+        })
+
+    return jsonify({
+        "mode": mode,
+        "domains_sent": len(domains),
+        "events_returned": len(events),
+        "unique_orgs_in_results": len(orgs_in_results),
+        "orgs_list": sorted(orgs_in_results, key=lambda x: (x or "")),
+        "pagination": pagination,
+        "sample_events": sample_events,
+        "response_top_keys": list(result.keys()),
+    })
+
 @app.route("/whoami", methods=["GET"])
 def whoami():
     browser_ip = be.check_ip()
