@@ -488,6 +488,130 @@ def search_people_by_domains(
 
     return all_people
 
+def get_companies_by_domains(domains):
+    """Bulk enrichment компаній через /organizations/bulk_enrich.
+    ЖОРСТКИЙ ліміт Apollo — до 10 доменів за один запит.
+    Повертає список компаній з повними полями + matched_domain для розкладки.
+    """
+    if not domains:
+        return []
+    if len(domains) > 10:
+        print(f"[bulk_enrich] увага: обрізаю {len(domains)} → 10 доменів (ліміт Apollo)")
+        domains = domains[:10]
+
+    from urllib.parse import urlencode
+    params = [("domains[]", d) for d in domains]
+    url = "https://app.apollo.io/api/v1/organizations/bulk_enrich?" + urlencode(params)
+
+    result, status = apollo_request("POST", url, json={})
+    if result is None:
+        print(f"[bulk_enrich] запит не пройшов (status={status})", flush=True)
+        return []
+
+    orgs = result.get("organizations", []) or []
+    companies = []
+    for org in orgs:
+        matched = _map_org_to_domain(org, domains)
+        companies.append({
+            "id": org.get("id"),
+            "name": org.get("name") or "",
+            "website_url": org.get("website_url") or "",
+            "primary_domain": org.get("primary_domain") or "",
+            "linkedin_url": org.get("linkedin_url"),
+            "twitter_url": org.get("twitter_url"),
+            "facebook_url": org.get("facebook_url"),
+            "phone": org.get("phone") or org.get("primary_phone"),
+            "industry": org.get("industry") or "",
+            "industries": org.get("industries") or [],
+            "secondary_industries": org.get("secondary_industries") or [],
+            "estimated_num_employees": org.get("estimated_num_employees"),
+            "founded_year": org.get("founded_year"),
+            "organization_revenue": org.get("organization_revenue"),
+            "organization_revenue_printed": org.get("organization_revenue_printed") or "",
+            "short_description": org.get("short_description") or "",
+            "keywords": org.get("keywords") or [],
+            "raw_address": org.get("raw_address") or "",
+            "street_address": org.get("street_address") or "",
+            "city": org.get("city"),
+            "state": org.get("state"),
+            "country": org.get("country"),
+            "postal_code": org.get("postal_code"),
+            "publicly_traded_symbol": org.get("publicly_traded_symbol"),
+            "publicly_traded_exchange": org.get("publicly_traded_exchange"),
+            "logo_url": org.get("logo_url"),
+            "crunchbase_url": org.get("crunchbase_url"),
+            "alexa_ranking": org.get("alexa_ranking"),
+            "matched_domain": matched,
+        })
+
+    print(f"[bulk_enrich] {len(domains)} доменів → {len(companies)} компаній", flush=True)
+    return companies
+
+
+def _map_org_to_domain(org, input_domains):
+    """Мапінг org → domain (аналог _map_person_to_domain, для компаній)."""
+    website_url = org.get("website_url") or org.get("primary_domain") or ""
+    extracted = _extract_domain_from_url(website_url)
+    normalized_input = {d.lower().strip().lstrip("www.") for d in input_domains if d}
+    if extracted and extracted in normalized_input:
+        return extracted
+    return extracted or "(unknown)"
+
+
+def get_jobs_by_org_ids(org_ids, max_pages=5):
+    """Отримати job postings через /newsfeed_events/search.
+    Приймає масив org_ids, пагінує до max_pages, повертає список jobs
+    з їхніми organization_id (для розкладки назад по доменах).
+    """
+    if not org_ids:
+        return []
+
+    max_pages = max(1, min(int(max_pages), 5))  # обмежуємо 1-5 (free-план)
+    all_jobs = []
+    page = 1
+
+    body_base = {
+        "organization_ids": list(org_ids),
+        "newsfeed_event_types": ["job_added"],
+        "per_page": 25,
+    }
+
+    while page <= max_pages:
+        body = dict(body_base)
+        body["page"] = page
+        result, status = apollo_request(
+            "POST",
+            "https://app.apollo.io/api/v1/newsfeed_events/search",
+            json=body,
+        )
+        if result is None:
+            print(f"[jobs] сторінка {page} не пройшла (status={status})", flush=True)
+            break
+
+        events = result.get("newsfeed_events", []) or []
+        pagination = result.get("pagination", {}) or {}
+        total_pages = pagination.get("total_pages", 0) or 0
+
+        for event in events:
+            job = event.get("job", {}) or {}
+            all_jobs.append({
+                "organization_id": event.get("organization_id"),
+                "title": job.get("title") or "",
+                "url": job.get("url") or "",
+                "city": job.get("city"),
+                "state": job.get("state"),
+                "country": job.get("country"),
+                "posted_at": job.get("posted_at"),
+            })
+
+        print(f"[jobs] сторінка {page}/{total_pages}: +{len(events)} jobs", flush=True)
+
+        if page >= total_pages or len(events) == 0:
+            break
+        page += 1
+
+    return all_jobs
+
 def resolve_domains_to_orgs(domains):
     org_map = {}
     unresolved = []
@@ -596,102 +720,60 @@ def search():
 
 @app.route("/company", methods=["POST"])
 def company():
-    data = request.json
-    domain = data.get("domain", "")
+    data = request.json or {}
+    domain = data.get("domain", "").strip()
     if not domain:
         return jsonify({"error": "domain is required"}), 400
 
+    # Батч-режим?
+    if data.get("batch"):
+        job_id = str(uuid.uuid4())
+        params = dict(data)
+        params["job_id"] = job_id
+        _set_job(job_id, status="queued", domain=domain)
+        add_to_company_batch(params)
+        return jsonify({"job_id": job_id, "status": "buffered", "domain": domain})
+
+    # Одиничний режим — використовуємо bulk_enrich з 1 доменом
     print(f"Запит /company: {domain}")
-    org_basic, domain_matched = get_organization_data(domain)
-    if not org_basic:
+    companies = get_companies_by_domains([domain])
+    if not companies:
         return jsonify({"error": f"Company not found: {domain}"}), 404
-
-    org = get_organization_full(org_basic["id"]) or org_basic
-
-    return jsonify({
-        "domain": domain,
-        "domain_matched": domain_matched,
-        "name": org.get("name"),
-        "description": org.get("short_description"),
-        "website_url": org.get("website_url"),
-        "linkedin_url": org.get("linkedin_url"),
-        "twitter_url": org.get("twitter_url"),
-        "facebook_url": org.get("facebook_url"),
-        "industry": org.get("industry"),
-        "industries": org.get("industries", []),
-        "secondary_industries": org.get("secondary_industries", []),
-        "estimated_num_employees": org.get("estimated_num_employees"),
-        "city": org.get("city"),
-        "state": org.get("state"),
-        "country": org.get("country"),
-        "raw_address": org.get("raw_address"),
-        "founded_year": org.get("founded_year"),
-        "publicly_traded_symbol": org.get("publicly_traded_symbol"),
-        "organization_revenue": org.get("organization_revenue"),
-        "organization_revenue_printed": org.get("organization_revenue_printed"),
-        "total_funding": org.get("total_funding"),
-        "total_funding_printed": org.get("total_funding_printed"),
-        "latest_funding_stage": org.get("latest_funding_stage"),
-        "latest_funding_round_date": org.get("latest_funding_round_date"),
-        "technology_names": org.get("technology_names", []),
-    })
-
+    return jsonify({"domain": domain, "company": companies[0]})
 
 @app.route("/jobs", methods=["POST"])
 def jobs():
-    data = request.json
-    domain = data.get("domain", "")
-    max_pages = data.get("max_pages", 1)
+    data = request.json or {}
+    domain = data.get("domain", "").strip()
+    max_pages = data.get("max_pages", 5)
     if not domain:
         return jsonify({"error": "domain is required"}), 400
 
+    # Батч-режим?
+    if data.get("batch"):
+        job_id = str(uuid.uuid4())
+        params = dict(data)
+        params["job_id"] = job_id
+        _set_job(job_id, status="queued", domain=domain)
+        add_to_jobs_batch(params)
+        return jsonify({"job_id": job_id, "status": "buffered", "domain": domain})
+
+    # Одиничний режим
     print(f"Запит /jobs: {domain}")
-    org_basic, _ = get_organization_data(domain)
-    if not org_basic:
+    companies = get_companies_by_domains([domain])
+    if not companies:
         return jsonify({"error": f"Company not found: {domain}"}), 404
 
-    org_id = org_basic["id"]
-    all_jobs = []
-    page = 1
+    company = companies[0]
+    org_id = company.get("id")
+    if not org_id:
+        return jsonify({"error": "no org_id in enrichment result"}), 500
 
-    while True:
-        body = {
-            "organization_ids": [org_id],
-            "newsfeed_event_types": ["job_added"],
-            "page": page,
-            "per_page": 25,
-        }
-        data, status = apollo_request(
-            "POST",
-            "https://app.apollo.io/api/v1/newsfeed_events/search",
-            json=body,
-        )
-        if data is None:
-            print(f"jobs failed (status={status})")
-            break
+    jobs_list = get_jobs_by_org_ids([org_id], max_pages=max_pages)
+    for job in jobs_list:
+        job["domain"] = company.get("matched_domain") or domain
 
-        events = data.get("newsfeed_events", [])
-        pagination = data.get("pagination", {})
-        total_pages = pagination.get("total_pages", 1)
-
-        for event in events:
-            job = event.get("job", {}) or {}
-            all_jobs.append({
-                "title": job.get("title") or event.get("title", ""),
-                "url": job.get("url") or event.get("url", ""),
-                "city": event.get("city", ""),
-                "state": event.get("state", ""),
-                "country": event.get("country", ""),
-                "posted_at": event.get("posted_at", ""),
-            })
-
-        if page >= total_pages or page >= max_pages:
-            break
-        page += 1
-
-    print(f"Знайдено вакансій: {len(all_jobs)} для {domain}")
-    return jsonify({"domain": domain, "total": len(all_jobs), "jobs": all_jobs})
-
+    return jsonify({"domain": domain, "total": len(jobs_list), "jobs": jobs_list})
 
 @app.route("/batch-search", methods=["POST"])
 def batch_search():
@@ -843,6 +925,168 @@ _batch_last_add = [0.0]
 _current_batch_size = [_pick_batch_size()]
 _current_batch_timeout = [_pick_batch_timeout()]
 
+# ══════════════════════════════════════════
+# БАТЧ-БУФЕРИ ДЛЯ /company І /jobs
+# ══════════════════════════════════════════
+
+COMPANY_BATCH_SIZE_MIN = int(os.environ.get("COMPANY_BATCH_SIZE_MIN", 5))
+COMPANY_BATCH_SIZE_MAX = int(os.environ.get("COMPANY_BATCH_SIZE_MAX", 10))
+COMPANY_BATCH_TIMEOUT_MIN = float(os.environ.get("COMPANY_BATCH_TIMEOUT_MIN", 30))
+COMPANY_BATCH_TIMEOUT_MAX = float(os.environ.get("COMPANY_BATCH_TIMEOUT_MAX", 90))
+
+JOBS_BATCH_SIZE_MIN = int(os.environ.get("JOBS_BATCH_SIZE_MIN", 5))
+JOBS_BATCH_SIZE_MAX = int(os.environ.get("JOBS_BATCH_SIZE_MAX", 10))
+JOBS_BATCH_TIMEOUT_MIN = float(os.environ.get("JOBS_BATCH_TIMEOUT_MIN", 30))
+JOBS_BATCH_TIMEOUT_MAX = float(os.environ.get("JOBS_BATCH_TIMEOUT_MAX", 90))
+
+_company_batch_buffer = []
+_company_batch_lock = threading.Lock()
+_company_batch_created_at = None
+_company_batch_size_target = None
+_company_batch_timeout_target = None
+
+_jobs_batch_buffer = []
+_jobs_batch_lock = threading.Lock()
+_jobs_batch_created_at = None
+_jobs_batch_size_target = None
+_jobs_batch_timeout_target = None
+
+
+def add_to_company_batch(params):
+    global _company_batch_created_at, _company_batch_size_target, _company_batch_timeout_target
+    with _company_batch_lock:
+        if not _company_batch_buffer:
+            _company_batch_created_at = time.time()
+            _company_batch_size_target = random.randint(COMPANY_BATCH_SIZE_MIN, COMPANY_BATCH_SIZE_MAX)
+            _company_batch_timeout_target = random.uniform(COMPANY_BATCH_TIMEOUT_MIN, COMPANY_BATCH_TIMEOUT_MAX)
+        _company_batch_buffer.append((params.get("job_id"), params))
+        n = len(_company_batch_buffer)
+        target = _company_batch_size_target
+        print(f"[company-batch] +{params.get('domain')} (у буфері {n}/{target})")
+        if n >= target:
+            _flush_company_batch(reason=f"досягнуто {n}")
+
+
+def _flush_company_batch(reason=""):
+    global _company_batch_created_at, _company_batch_size_target, _company_batch_timeout_target
+    if not _company_batch_buffer:
+        return
+    items = list(_company_batch_buffer)
+    _company_batch_buffer.clear()
+    _company_batch_created_at = None
+    _company_batch_size_target = None
+    _company_batch_timeout_target = None
+    batch_id = str(uuid.uuid4())
+    _set_job(batch_id, status="queued", kind="company-batch", size=len(items))
+    print(f"[company-batch {batch_id[:8]}] запуск балку ({reason}): {len(items)} доменів")
+    _job_queue.put((batch_id, {"__company_batch_items__": items}))
+
+
+def add_to_jobs_batch(params):
+    global _jobs_batch_created_at, _jobs_batch_size_target, _jobs_batch_timeout_target
+    with _jobs_batch_lock:
+        if not _jobs_batch_buffer:
+            _jobs_batch_created_at = time.time()
+            _jobs_batch_size_target = random.randint(JOBS_BATCH_SIZE_MIN, JOBS_BATCH_SIZE_MAX)
+            _jobs_batch_timeout_target = random.uniform(JOBS_BATCH_TIMEOUT_MIN, JOBS_BATCH_TIMEOUT_MAX)
+        _jobs_batch_buffer.append((params.get("job_id"), params))
+        n = len(_jobs_batch_buffer)
+        target = _jobs_batch_size_target
+        print(f"[jobs-batch] +{params.get('domain')} (у буфері {n}/{target})")
+        if n >= target:
+            _flush_jobs_batch(reason=f"досягнуто {n}")
+
+
+def _flush_jobs_batch(reason=""):
+    global _jobs_batch_created_at, _jobs_batch_size_target, _jobs_batch_timeout_target
+    if not _jobs_batch_buffer:
+        return
+    items = list(_jobs_batch_buffer)
+    _jobs_batch_buffer.clear()
+    _jobs_batch_created_at = None
+    _jobs_batch_size_target = None
+    _jobs_batch_timeout_target = None
+    batch_id = str(uuid.uuid4())
+    _set_job(batch_id, status="queued", kind="jobs-batch", size=len(items))
+    print(f"[jobs-batch {batch_id[:8]}] запуск балку ({reason}): {len(items)} доменів")
+    _job_queue.put((batch_id, {"__jobs_batch_items__": items}))
+
+
+def process_company_batch_job(batch_id, items):
+    first = items[0][1] if items else {}
+    webhook_url = (first.get("webhook_url") or CLAY_WEBHOOK_URL or "").strip()
+    webhook_token = (first.get("webhook_token") or CLAY_WEBHOOK_TOKEN or "").strip()
+
+    domains = [p["domain"] for _, p in items]
+    print(f"[company-batch {batch_id[:8]}] enrichment для {len(domains)} доменів...")
+
+    companies = get_companies_by_domains(domains)
+    if not companies:
+        _set_job(batch_id, status="done", companies_found=0, companies_sent=0)
+        return
+
+    sent = 0
+    skipped_unknown = 0
+    for c in companies:
+        domain = c.get("matched_domain") or ""
+        if not domain or domain == "(unknown)":
+            skipped_unknown += 1
+            continue
+        if send_person_to_clay(c, domain, webhook_url, webhook_token):
+            sent += 1
+
+    if skipped_unknown:
+        print(f"[company-batch {batch_id[:8]}] пропущено {skipped_unknown} без чіткого домену")
+
+    _set_job(batch_id, status="done", companies_found=len(companies), companies_sent=sent)
+    print(f"[company-batch {batch_id[:8]}] enrichment завершено: знайдено {len(companies)}, відправлено {sent}")
+
+
+def process_jobs_batch_job(batch_id, items):
+    first = items[0][1] if items else {}
+    webhook_url = (first.get("webhook_url") or CLAY_WEBHOOK_URL or "").strip()
+    webhook_token = (first.get("webhook_token") or CLAY_WEBHOOK_TOKEN or "").strip()
+    max_pages = first.get("max_pages", 5)
+
+    domains = [p["domain"] for _, p in items]
+    print(f"[jobs-batch {batch_id[:8]}] крок 1: bulk_enrich для {len(domains)} доменів...")
+
+    companies = get_companies_by_domains(domains)
+    if not companies:
+        _set_job(batch_id, status="done", jobs_found=0, jobs_sent=0)
+        return
+
+    # мапа org_id → domain
+    org_to_domain = {}
+    for c in companies:
+        oid = c.get("id")
+        dom = c.get("matched_domain")
+        if oid and dom and dom != "(unknown)":
+            org_to_domain[oid] = dom
+
+    org_ids = list(org_to_domain.keys())
+    if not org_ids:
+        _set_job(batch_id, status="done", jobs_found=0, jobs_sent=0)
+        return
+
+    print(f"[jobs-batch {batch_id[:8]}] крок 2: newsfeed_events для {len(org_ids)} org_ids, max_pages={max_pages}")
+    jobs_list = get_jobs_by_org_ids(org_ids, max_pages=max_pages)
+
+    sent = 0
+    per_domain_count = {}
+    for job in jobs_list:
+        oid = job.get("organization_id")
+        domain = org_to_domain.get(oid)
+        if not domain:
+            continue
+        per_domain_count[domain] = per_domain_count.get(domain, 0) + 1
+        if send_person_to_clay(job, domain, webhook_url, webhook_token):
+            sent += 1
+
+    _set_job(batch_id, status="done", jobs_found=len(jobs_list), jobs_sent=sent)
+    print(f"[jobs-batch {batch_id[:8]}] знайдено {len(jobs_list)} jobs, відправлено {sent}")
+    for d, c in sorted(per_domain_count.items(), key=lambda x: -x[1])[:10]:
+        print(f"[jobs-batch {batch_id[:8]}]   {d}: {c} jobs")
 
 def add_to_batch(job_id, params):
     fire = False
@@ -873,18 +1117,38 @@ def _flush_batch(reason):
     _set_job(batch_id, status="queued", kind="batch", size=len(items))
     _job_queue.put((batch_id, {"__batch_items__": items}))
 
-
 def _batch_watcher():
+    print("Балк-watcher запущено")
     while True:
         time.sleep(1)
-        with _batch_lock:
-            n = len(_batch_buffer)
-            quiet = (time.time() - _batch_last_add[0]) if _batch_buffer else 0
-            current_timeout = _current_batch_timeout[0]
-            timeout_hit = n > 0 and quiet >= current_timeout
-        if timeout_hit:
-            _flush_batch(f"тиша {int(quiet)}с (порог {int(current_timeout)}с), {n} доменів")
+        now = time.time()
 
+        # search-async буфер (як було)
+        with _batch_lock:
+            if _batch_buffer:
+                quiet = now - _batch_last_add[0]
+                current_timeout = _current_batch_timeout[0]
+                n = len(_batch_buffer)
+                if n > 0 and quiet >= current_timeout:
+                    _flush_batch(reason=f"тиша {quiet:.0f}с (порог {current_timeout:.0f}с), {n} доменів")
+
+        # company буфер
+        with _company_batch_lock:
+            if _company_batch_buffer and _company_batch_created_at:
+                quiet = now - _company_batch_created_at
+                current_timeout = _company_batch_timeout_target or COMPANY_BATCH_TIMEOUT_MAX
+                n = len(_company_batch_buffer)
+                if n > 0 and quiet >= current_timeout:
+                    _flush_company_batch(reason=f"тиша {quiet:.0f}с (порог {current_timeout:.0f}с), {n} доменів")
+
+        # jobs буфер
+        with _jobs_batch_lock:
+            if _jobs_batch_buffer and _jobs_batch_created_at:
+                quiet = now - _jobs_batch_created_at
+                current_timeout = _jobs_batch_timeout_target or JOBS_BATCH_TIMEOUT_MAX
+                n = len(_jobs_batch_buffer)
+                if n > 0 and quiet >= current_timeout:
+                    _flush_jobs_batch(reason=f"тиша {quiet:.0f}с (порог {current_timeout:.0f}с), {n} доменів")
 
 def process_batch_job(batch_id, items):
     first = items[0][1]
@@ -956,8 +1220,12 @@ def _worker(worker_id):
                 print(f"[worker {worker_id}] капча активна — чекаю, черга на паузі")
                 notify_captcha()
                 time.sleep(15)
-            if isinstance(params, dict) and "__batch_items__" in params:
+            if "__batch_items__" in params:
                 process_batch_job(job_id, params["__batch_items__"])
+            elif "__company_batch_items__" in params:
+                process_company_batch_job(job_id, params["__company_batch_items__"])
+            elif "__jobs_batch_items__" in params:
+                process_jobs_batch_job(job_id, params["__jobs_batch_items__"])
             else:
                 process_search_job(job_id, params)
         finally:
